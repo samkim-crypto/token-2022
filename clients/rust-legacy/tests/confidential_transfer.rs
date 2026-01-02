@@ -3279,6 +3279,37 @@ async fn test_confidential_transfer_pending_decryption_after_transfer() {
     }
 }
 
+#[tokio::test]
+async fn fail_initialize_non_transferable_confidential_mint_without_mint_burn() {
+    let authority = Keypair::new();
+    let auto_approve_new_accounts = true;
+    let auditor_elgamal_keypair = ElGamalKeypair::new_rand();
+    let auditor_elgamal_pubkey = (*auditor_elgamal_keypair.pubkey()).into();
+
+    let mut context = TestContext::new().await;
+    let err = context
+        .init_token_with_mint(vec![
+            ExtensionInitializationParams::NonTransferable,
+            ExtensionInitializationParams::ConfidentialTransferMint {
+                authority: Some(authority.pubkey()),
+                auto_approve_new_accounts,
+                auditor_elgamal_pubkey: Some(auditor_elgamal_pubkey),
+            },
+        ])
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        TokenClientError::Client(Box::new(TransportError::TransactionError(
+            TransactionError::InstructionError(
+                3,
+                InstructionError::Custom(TokenError::InvalidExtensionCombination as u32)
+            )
+        )))
+    );
+}
+
 #[cfg(test)]
 mod unit_tests {
 
