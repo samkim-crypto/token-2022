@@ -1,4 +1,4 @@
-pub use solana_zk_sdk::zk_elgamal_proof_program::{
+pub use solana_zk_elgamal_proof_interface::{
     instruction::ProofInstruction, proof_data::*, state::ProofContextState,
 };
 #[cfg(feature = "serde")]

@@ -41,15 +41,18 @@ use {
         encryption::BurnAmountCiphertext, errors::TokenProofGenerationError,
         try_combine_lo_hi_ciphertexts, try_split_u64, CiphertextValidityProofWithAuditorCiphertext,
     },
+    solana_zk_elgamal_proof_interface::proof_data::{
+        BatchedRangeProofU128Data, CiphertextCommitmentEqualityProofData, ZkProofData,
+    },
     solana_zk_sdk::{
         encryption::{
             auth_encryption::{AeCiphertext, AeKey},
             elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
             pedersen::Pedersen,
         },
-        zk_elgamal_proof_program::proof_data::{
-            BatchedGroupedCiphertext3HandlesValidityProofData, BatchedRangeProofU128Data,
-            CiphertextCommitmentEqualityProofData, ZkProofData,
+        zk_elgamal_proof_program::{
+            build_batched_range_proof_u128_data, build_ciphertext_commitment_equality_proof_data,
+            new_batched_grouped_ciphertext_3_handles_validity_proof_data,
         },
     },
 };
@@ -151,7 +154,7 @@ pub fn burn_split_proof_data(
         Pedersen::new(remaining_balance);
 
     // generate equality proof data
-    let equality_proof_data = CiphertextCommitmentEqualityProofData::new(
+    let equality_proof_data = build_ciphertext_commitment_equality_proof_data(
         source_elgamal_keypair,
         &new_available_balance_ciphertext,
         &new_available_balance_commitment,
@@ -161,18 +164,19 @@ pub fn burn_split_proof_data(
     .map_err(TokenProofGenerationError::from)?;
 
     // generate ciphertext validity data
-    let ciphertext_validity_proof_data = BatchedGroupedCiphertext3HandlesValidityProofData::new(
-        source_elgamal_keypair.pubkey(),
-        supply_elgamal_pubkey,
-        auditor_elgamal_pubkey,
-        &grouped_ciphertext_lo,
-        &grouped_ciphertext_hi,
-        burn_amount_lo,
-        burn_amount_hi,
-        &burn_amount_opening_lo,
-        &burn_amount_opening_hi,
-    )
-    .map_err(TokenProofGenerationError::from)?;
+    let ciphertext_validity_proof_data =
+        new_batched_grouped_ciphertext_3_handles_validity_proof_data(
+            source_elgamal_keypair.pubkey(),
+            supply_elgamal_pubkey,
+            auditor_elgamal_pubkey,
+            &grouped_ciphertext_lo,
+            &grouped_ciphertext_hi,
+            burn_amount_lo,
+            burn_amount_hi,
+            &burn_amount_opening_lo,
+            &burn_amount_opening_hi,
+        )
+        .map_err(TokenProofGenerationError::from)?;
 
     let burn_amount_auditor_ciphertext_lo = ciphertext_validity_proof_data
         .context_data()
@@ -199,7 +203,7 @@ pub fn burn_split_proof_data(
     // therefore, create a Pedersen commitment to 0 and use it as a dummy commitment to a 16-bit
     // value
     let (padding_commitment, padding_opening) = Pedersen::new(0_u64);
-    let range_proof_data = BatchedRangeProofU128Data::new(
+    let range_proof_data = build_batched_range_proof_u128_data(
         vec![
             &new_available_balance_commitment,
             burn_amount_ciphertext_lo.get_commitment(),

@@ -41,14 +41,17 @@ use {
         encryption::MintAmountCiphertext, errors::TokenProofGenerationError,
         try_combine_lo_hi_ciphertexts, try_split_u64, CiphertextValidityProofWithAuditorCiphertext,
     },
+    solana_zk_elgamal_proof_interface::proof_data::{
+        BatchedRangeProofU128Data, CiphertextCommitmentEqualityProofData, ZkProofData,
+    },
     solana_zk_sdk::{
         encryption::{
             elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
             pedersen::Pedersen,
         },
-        zk_elgamal_proof_program::proof_data::{
-            BatchedGroupedCiphertext3HandlesValidityProofData, BatchedRangeProofU128Data,
-            CiphertextCommitmentEqualityProofData, ZkProofData,
+        zk_elgamal_proof_program::{
+            build_batched_range_proof_u128_data, build_ciphertext_commitment_equality_proof_data,
+            new_batched_grouped_ciphertext_3_handles_validity_proof_data,
         },
     },
 };
@@ -145,7 +148,7 @@ pub fn mint_split_proof_data(
     let (new_supply_commitment, new_supply_opening) = Pedersen::new(new_supply);
 
     // generate equality proof data
-    let equality_proof_data = CiphertextCommitmentEqualityProofData::new(
+    let equality_proof_data = build_ciphertext_commitment_equality_proof_data(
         supply_elgamal_keypair,
         &new_supply_ciphertext,
         &new_supply_commitment,
@@ -155,18 +158,19 @@ pub fn mint_split_proof_data(
     .map_err(TokenProofGenerationError::from)?;
 
     // generate ciphertext validity proof data
-    let ciphertext_validity_proof_data = BatchedGroupedCiphertext3HandlesValidityProofData::new(
-        destination_elgamal_pubkey,
-        supply_elgamal_keypair.pubkey(),
-        auditor_elgamal_pubkey,
-        &grouped_ciphertext_lo,
-        &grouped_ciphertext_hi,
-        mint_amount_lo,
-        mint_amount_hi,
-        &mint_amount_opening_lo,
-        &mint_amount_opening_hi,
-    )
-    .map_err(TokenProofGenerationError::from)?;
+    let ciphertext_validity_proof_data =
+        new_batched_grouped_ciphertext_3_handles_validity_proof_data(
+            destination_elgamal_pubkey,
+            supply_elgamal_keypair.pubkey(),
+            auditor_elgamal_pubkey,
+            &grouped_ciphertext_lo,
+            &grouped_ciphertext_hi,
+            mint_amount_lo,
+            mint_amount_hi,
+            &mint_amount_opening_lo,
+            &mint_amount_opening_hi,
+        )
+        .map_err(TokenProofGenerationError::from)?;
 
     let mint_amount_auditor_ciphertext_lo = ciphertext_validity_proof_data
         .context_data()
@@ -193,7 +197,7 @@ pub fn mint_split_proof_data(
     // therefore, create a Pedersen commitment to 0 and use it as a dummy commitment to a 16-bit
     // value
     let (padding_commitment, padding_opening) = Pedersen::new(0_u64);
-    let range_proof_data = BatchedRangeProofU128Data::new(
+    let range_proof_data = build_batched_range_proof_u128_data(
         vec![
             &new_supply_commitment,
             mint_amount_grouped_ciphertext_lo.get_commitment(),

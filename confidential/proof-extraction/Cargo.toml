@@ -18,6 +18,7 @@ solana-instructions-sysvar = "3.0.0"
 solana-msg = "3.1.0"
 solana-program-error = "3.0.1"
 solana-sdk-ids = "3.1.0"
-solana-zk-sdk = "4.0.0"
-spl-pod = "0.7.3"
+solana-zk-elgamal-proof-interface = { path = "../../../zk-elgamal-proof/interface" }
+solana-zk-sdk-pod = { path = "../../../zk-elgamal-proof/zk-sdk-pod" }
+spl-pod = "0.7.2"
 thiserror = "2.0.18"

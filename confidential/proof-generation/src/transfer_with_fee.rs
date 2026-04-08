@@ -61,16 +61,21 @@ use {
         TRANSFER_AMOUNT_LO_BITS,
     },
     curve25519_dalek::scalar::Scalar,
+    solana_zk_elgamal_proof_interface::proof_data::{
+        BatchedGroupedCiphertext2HandlesValidityProofData, BatchedRangeProofU256Data,
+        CiphertextCommitmentEqualityProofData, PercentageWithCapProofData, ZkProofData,
+    },
     solana_zk_sdk::{
         encryption::{
             auth_encryption::{AeCiphertext, AeKey},
             elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
             pedersen::{Pedersen, PedersenCommitment, PedersenOpening},
         },
-        zk_elgamal_proof_program::proof_data::{
-            BatchedGroupedCiphertext2HandlesValidityProofData,
-            BatchedGroupedCiphertext3HandlesValidityProofData, BatchedRangeProofU256Data,
-            CiphertextCommitmentEqualityProofData, PercentageWithCapProofData, ZkProofData,
+        zk_elgamal_proof_program::{
+            build_batched_range_proof_u256_data, build_ciphertext_commitment_equality_proof_data,
+            build_percentage_with_cap_proof_data,
+            new_batched_grouped_ciphertext_2_handles_validity_proof_data,
+            new_batched_grouped_ciphertext_3_handles_validity_proof_data,
         },
     },
 };
@@ -190,7 +195,7 @@ pub fn transfer_with_fee_split_proof_data(
         .ok_or(TokenProofGenerationError::IllegalAmountBitLength)?;
 
     // generate equality proof data
-    let equality_proof_data = CiphertextCommitmentEqualityProofData::new(
+    let equality_proof_data = build_ciphertext_commitment_equality_proof_data(
         source_elgamal_keypair,
         &new_available_balance_ciphertext,
         &new_available_balance_commitment,
@@ -201,7 +206,7 @@ pub fn transfer_with_fee_split_proof_data(
 
     // generate ciphertext validity data
     let transfer_amount_ciphertext_validity_proof_data =
-        BatchedGroupedCiphertext3HandlesValidityProofData::new(
+        new_batched_grouped_ciphertext_3_handles_validity_proof_data(
             source_elgamal_keypair.pubkey(),
             destination_elgamal_pubkey,
             auditor_elgamal_pubkey,
@@ -307,7 +312,7 @@ pub fn transfer_with_fee_split_proof_data(
     );
 
     // generate fee sigma proof
-    let percentage_with_cap_proof_data = PercentageWithCapProofData::new(
+    let percentage_with_cap_proof_data = build_percentage_with_cap_proof_data(
         &combined_fee_commitment,
         &combined_fee_opening,
         fee_amount,
@@ -360,7 +365,7 @@ pub fn transfer_with_fee_split_proof_data(
 
     // generate fee ciphertext validity data
     let fee_ciphertext_validity_proof_data =
-        BatchedGroupedCiphertext2HandlesValidityProofData::new(
+        new_batched_grouped_ciphertext_2_handles_validity_proof_data(
             destination_elgamal_pubkey,
             withdraw_withheld_authority_elgamal_pubkey,
             &fee_destination_withdraw_withheld_authority_ciphertext_lo,
@@ -385,7 +390,7 @@ pub fn transfer_with_fee_split_proof_data(
     #[allow(clippy::arithmetic_side_effects)]
     let claimed_complement_opening = PedersenOpening::default() - &claimed_opening;
 
-    let range_proof_data = BatchedRangeProofU256Data::new(
+    let range_proof_data = build_batched_range_proof_u256_data(
         vec![
             &new_available_balance_commitment,
             transfer_amount_grouped_ciphertext_lo.get_commitment(),
