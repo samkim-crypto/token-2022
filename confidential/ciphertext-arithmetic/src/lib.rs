@@ -4,7 +4,7 @@ use {
         ristretto::{add_ristretto, multiply_ristretto, subtract_ristretto, PodRistrettoPoint},
         scalar::PodScalar,
     },
-    solana_zk_sdk::encryption::pod::elgamal::PodElGamalCiphertext,
+    solana_zk_sdk_pod::encryption::elgamal::PodElGamalCiphertext,
 };
 
 const SHIFT_BITS: usize = 16;
