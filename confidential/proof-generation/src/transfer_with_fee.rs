@@ -72,10 +72,10 @@ use {
             pedersen::{Pedersen, PedersenCommitment, PedersenOpening},
         },
         zk_elgamal_proof_program::{
+            build_batched_grouped_ciphertext_2_handles_validity_proof_data,
+            build_batched_grouped_ciphertext_3_handles_validity_proof_data,
             build_batched_range_proof_u256_data, build_ciphertext_commitment_equality_proof_data,
             build_percentage_with_cap_proof_data,
-            new_batched_grouped_ciphertext_2_handles_validity_proof_data,
-            new_batched_grouped_ciphertext_3_handles_validity_proof_data,
         },
     },
 };
@@ -206,7 +206,7 @@ pub fn transfer_with_fee_split_proof_data(
 
     // generate ciphertext validity data
     let transfer_amount_ciphertext_validity_proof_data =
-        new_batched_grouped_ciphertext_3_handles_validity_proof_data(
+        build_batched_grouped_ciphertext_3_handles_validity_proof_data(
             source_elgamal_keypair.pubkey(),
             destination_elgamal_pubkey,
             auditor_elgamal_pubkey,
@@ -365,7 +365,7 @@ pub fn transfer_with_fee_split_proof_data(
 
     // generate fee ciphertext validity data
     let fee_ciphertext_validity_proof_data =
-        new_batched_grouped_ciphertext_2_handles_validity_proof_data(
+        build_batched_grouped_ciphertext_2_handles_validity_proof_data(
             destination_elgamal_pubkey,
             withdraw_withheld_authority_elgamal_pubkey,
             &fee_destination_withdraw_withheld_authority_ciphertext_lo,

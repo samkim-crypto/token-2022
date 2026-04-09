@@ -8173,6 +8173,10 @@ name = "solana-nullable"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da028344c595c7416769ff648d206de7962571291a4cea24c38a60b6f40d53bb"
+dependencies = [
+ "bytemuck",
+ "serde",
+]
 
 [[package]]
 name = "solana-offchain-message"
@@ -10694,6 +10698,7 @@ dependencies = [
  "solana-account-info",
  "solana-address 2.6.0",
  "solana-instruction",
+ "solana-nullable",
  "solana-program-error",
  "solana-program-option",
  "solana-program-pack",

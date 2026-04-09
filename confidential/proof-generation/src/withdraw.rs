@@ -39,7 +39,7 @@ use {
     },
     solana_zk_sdk::{
         encryption::{
-            elgamal::{ElGamal, ElGamalCiphertext, ElGamalKeypair},
+            elgamal::{ElGamalCiphertext, ElGamalKeypair},
             pedersen::Pedersen,
         },
         zk_elgamal_proof_program::{
@@ -72,8 +72,8 @@ pub fn withdraw_proof_data(
         Pedersen::new(remaining_balance);
 
     // Compute the remaining balance ciphertext
-    #[allow(clippy::arithmetic_side_effects, deprecated)]
-    let remaining_balance_ciphertext = current_available_balance - ElGamal::encode(withdraw_amount);
+    #[allow(clippy::arithmetic_side_effects)]
+    let remaining_balance_ciphertext = current_available_balance.subtract_amount(withdraw_amount);
 
     // Generate proof data
     let equality_proof_data = build_ciphertext_commitment_equality_proof_data(

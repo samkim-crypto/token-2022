@@ -50,8 +50,8 @@ use {
             pedersen::Pedersen,
         },
         zk_elgamal_proof_program::{
+            build_batched_grouped_ciphertext_3_handles_validity_proof_data,
             build_batched_range_proof_u128_data, build_ciphertext_commitment_equality_proof_data,
-            new_batched_grouped_ciphertext_3_handles_validity_proof_data,
         },
     },
 };
@@ -159,7 +159,7 @@ pub fn mint_split_proof_data(
 
     // generate ciphertext validity proof data
     let ciphertext_validity_proof_data =
-        new_batched_grouped_ciphertext_3_handles_validity_proof_data(
+        build_batched_grouped_ciphertext_3_handles_validity_proof_data(
             destination_elgamal_pubkey,
             supply_elgamal_keypair.pubkey(),
             auditor_elgamal_pubkey,
