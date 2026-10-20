@@ -34,7 +34,8 @@ use {
             confidential_mint_burn::ConfidentialMintBurn,
             confidential_transfer::{instruction::*, *},
             confidential_transfer_fee::{
-                ConfidentialTransferFeeAmount, ConfidentialTransferFeeConfig,
+                account_key_index, current_key_index, ConfidentialTransferFeeAmount,
+                ConfidentialTransferFeeConfig, ConfidentialTransferFeeKeyIndex,
                 EncryptedWithheldAmount,
             },
             cpi_guard::CpiGuard,
@@ -123,7 +124,7 @@ fn process_configure_account_with_registry(
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter_mut();
     let token_account_info = next_account_view(account_info_iter)?;
-    let _mint_info = next_account_view(account_info_iter)?;
+    let mint_info = next_account_view(account_info_iter)?;
     let elgamal_registry_account = next_account_view(account_info_iter)?;
 
     check_elgamal_registry_program_account(elgamal_registry_account.owner())?;
@@ -131,7 +132,7 @@ fn process_configure_account_with_registry(
     // if a payer account for reallcation is provided, then reallocate
     if let Ok(payer_info) = next_account_view(account_info_iter) {
         let _system_program_info = next_account_view(account_info_iter)?;
-        reallocate_for_configure_account_with_registry(token_account_info, payer_info)?;
+        reallocate_for_configure_account_with_registry(token_account_info, mint_info, payer_info)?;
     }
 
     // Note: Make a copy of the ElGamalRegistry account so we can use the accounts array
@@ -159,6 +160,7 @@ fn process_configure_account_with_registry(
 
 fn reallocate_for_configure_account_with_registry(
     token_account_info: &mut AccountView,
+    mint_info: &AccountView,
     payer_info: &AccountView,
 ) -> ProgramResult {
     let mut current_extension_types = {
@@ -171,9 +173,24 @@ fn reallocate_for_configure_account_with_registry(
     current_extension_types.push(ExtensionType::ConfidentialTransferAccount);
     if current_extension_types.contains(&ExtensionType::TransferFeeAmount) {
         current_extension_types.push(ExtensionType::ConfidentialTransferFeeAmount);
+
+        let mint_data = mint_info.try_borrow()?;
+        let mint = PodStateWithExtensions::<PodMint>::unpack(&mint_data)?;
+        if current_key_index(&mint)? > 0 {
+            current_extension_types.push(ExtensionType::ConfidentialTransferFeeKeyIndex);
+        }
     }
-    let needed_account_len =
-        ExtensionType::try_calculate_account_len::<Account>(&current_extension_types)?;
+    reallocate_for_extension_types(token_account_info, payer_info, &current_extension_types)
+}
+
+/// Reallocates a token account to fit the given extension types, with the payer
+/// funding any additional rent
+pub(crate) fn reallocate_for_extension_types(
+    token_account_info: &mut AccountView,
+    payer_info: &AccountView,
+    extension_types: &[ExtensionType],
+) -> ProgramResult {
+    let needed_account_len = ExtensionType::try_calculate_account_len::<Account>(extension_types)?;
 
     // if account is already large enough, return early
     if token_account_info.data_len() >= needed_account_len {
@@ -301,6 +318,15 @@ fn process_configure_account(
         let confidential_transfer_fee_amount =
             token_account.init_extension::<ConfidentialTransferFeeAmount>(false)?;
         confidential_transfer_fee_amount.withheld_amount = EncryptedWithheldAmount::zeroed();
+
+        // once the mint has rotated its withdraw withheld authority ElGamal key,
+        // accounts must track the key index of their withheld amount
+        let current_key_index = current_key_index(&mint)?;
+        if current_key_index > 0 {
+            let confidential_transfer_fee_key_index =
+                token_account.init_extension::<ConfidentialTransferFeeKeyIndex>(false)?;
+            confidential_transfer_fee_key_index.key_index = current_key_index.into();
+        }
     }
 
     Ok(())
@@ -801,6 +827,7 @@ fn process_transfer(
             mint_info,
             &proof_context,
             is_self_transfer,
+            current_key_index(&mint)?,
         )?;
 
         authority_info
@@ -1085,6 +1112,7 @@ fn process_destination_for_transfer_with_fee(
     mint_info: &AccountView,
     proof_context: &TransferWithFeeProofContext,
     is_self_transfer: bool,
+    current_key_index: u64,
 ) -> ProgramResult {
     check_program_account(destination_account_info.owner())?;
     let destination_token_account_data = &mut destination_account_info.try_borrow_mut()?;
@@ -1173,6 +1201,28 @@ fn process_destination_for_transfer_with_fee(
             .fee_ciphertext_hi
             .try_extract_ciphertext(1)
             .map_err(TokenError::from)?;
+
+        // The fee can only be added to a withheld amount under the same withdraw
+        // withheld authority ElGamal key
+        let destination_key_index = account_key_index(&destination_token_account)?;
+        if destination_key_index.is_some_and(|key_index| key_index > current_key_index) {
+            return Err(TokenError::ConfidentialTransferFeeKeyIndexMismatch.into());
+        }
+        if current_key_index > 0 {
+            let destination_key_index =
+                destination_key_index.ok_or(TokenError::ConfidentialTransferFeeKeyIndexMissing)?;
+            if destination_key_index != current_key_index {
+                let destination_withheld_amount = destination_token_account
+                    .get_extension::<ConfidentialTransferFeeAmount>()?
+                    .withheld_amount;
+                if destination_withheld_amount != EncryptedWithheldAmount::zeroed() {
+                    return Err(TokenError::ConfidentialTransferFeeWithheldAmountStale.into());
+                }
+                destination_token_account
+                    .get_extension_mut::<ConfidentialTransferFeeKeyIndex>()?
+                    .key_index = current_key_index.into();
+            }
+        }
 
         let destination_confidential_transfer_fee_amount =
             destination_token_account.get_extension_mut::<ConfidentialTransferFeeAmount>()?;

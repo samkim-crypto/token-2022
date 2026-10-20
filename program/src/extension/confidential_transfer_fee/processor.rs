@@ -1,6 +1,10 @@
 use {
-    crate::processor::Processor,
+    crate::{
+        extension::confidential_transfer::processor::reallocate_for_extension_types,
+        processor::Processor,
+    },
     bytemuck::Zeroable,
+    core::cmp::Ordering,
     pinocchio::{account::next_account_view, AccountView},
     solana_address::Address,
     solana_msg::msg,
@@ -11,23 +15,34 @@ use {
         check_program_account,
         error::TokenError,
         extension::{
+            alloc_and_append_to_variable_len_extension,
             confidential_transfer::{
                 instruction::{
-                    CiphertextCiphertextEqualityProofContext, CiphertextCiphertextEqualityProofData,
+                    CiphertextCiphertextEqualityProofContext,
+                    CiphertextCiphertextEqualityProofData, PubkeyValidityProofContext,
+                    PubkeyValidityProofData,
                 },
                 ConfidentialTransferAccount, DecryptableBalance,
             },
             confidential_transfer_fee::{
+                account_key_index, current_key_index,
                 instruction::{
                     ConfidentialTransferFeeInstruction,
                     InitializeConfidentialTransferFeeConfigData,
-                    WithdrawWithheldTokensFromAccountsData, WithdrawWithheldTokensFromMintData,
+                    RotateWithdrawWithheldAuthorityElGamalPubkeyData,
+                    WithdrawWithheldTokensFromAccountsData,
+                    WithdrawWithheldTokensFromAccountsForKeyIndexData,
+                    WithdrawWithheldTokensFromMintData,
+                    WithdrawWithheldTokensFromMintForKeyIndexData,
                 },
                 ConfidentialTransferFeeAmount, ConfidentialTransferFeeConfig,
-                EncryptedWithheldAmount,
+                ConfidentialTransferFeeKeyHistory, ConfidentialTransferFeeKeyIndex,
+                ConfidentialTransferFeeKeyRecord, EncryptedWithheldAmount, MAX_KEY_HISTORY_LEN,
             },
+            mint_close_authority::MintCloseAuthority,
             transfer_fee::TransferFeeConfig,
-            BaseStateWithExtensions, BaseStateWithExtensionsMut, PodStateWithExtensionsMut,
+            BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType,
+            PodStateWithExtensions, PodStateWithExtensionsMut,
         },
         instruction::{decode_instruction_data, decode_instruction_type},
         pod::{PodAccount, PodMint},
@@ -58,10 +73,70 @@ fn process_initialize_confidential_transfer_fee_config(
     Ok(())
 }
 
-/// Processes a [`WithdrawWithheldTokensFromMint`] instruction.
+/// Returns the withdraw withheld authority ElGamal public key for a key index
+fn get_key_index_elgamal_pubkey(
+    mint: &PodStateWithExtensionsMut<'_, PodMint>,
+    key_index: u64,
+    current_key_index: u64,
+) -> Result<PodElGamalPubkey, ProgramError> {
+    match key_index.cmp(&current_key_index) {
+        Ordering::Equal => Ok(mint
+            .get_extension::<ConfidentialTransferFeeConfig>()?
+            .withdraw_withheld_authority_elgamal_pubkey),
+        Ordering::Less => {
+            let records = ConfidentialTransferFeeKeyHistory::records_from_bytes(
+                mint.get_extension_bytes::<ConfidentialTransferFeeKeyHistory>()?,
+            )?;
+            usize::try_from(key_index)
+                .ok()
+                .and_then(|key_index| records.get(key_index))
+                .map(|record| record.withdraw_withheld_authority_elgamal_pubkey)
+                .ok_or_else(|| TokenError::ConfidentialTransferFeeKeyIndexMismatch.into())
+        }
+        Ordering::Greater => Err(TokenError::ConfidentialTransferFeeKeyIndexMismatch.into()),
+    }
+}
+
+/// Returns the withdraw withheld authority ElGamal public key and the mint
+/// withheld amount for a key index
+fn get_key_index_bucket_mut<'a>(
+    mint: &'a mut PodStateWithExtensionsMut<'_, PodMint>,
+    key_index: u64,
+    current_key_index: u64,
+) -> Result<(PodElGamalPubkey, &'a mut EncryptedWithheldAmount), ProgramError> {
+    match key_index.cmp(&current_key_index) {
+        Ordering::Equal => {
+            let confidential_transfer_fee_config =
+                mint.get_extension_mut::<ConfidentialTransferFeeConfig>()?;
+            Ok((
+                confidential_transfer_fee_config.withdraw_withheld_authority_elgamal_pubkey,
+                &mut confidential_transfer_fee_config.withheld_amount,
+            ))
+        }
+        Ordering::Less => {
+            let records = ConfidentialTransferFeeKeyHistory::records_from_bytes_mut(
+                mint.get_extension_bytes_mut::<ConfidentialTransferFeeKeyHistory>()?,
+            )?;
+            let record = usize::try_from(key_index)
+                .ok()
+                .and_then(|key_index| records.get_mut(key_index))
+                .ok_or(TokenError::ConfidentialTransferFeeKeyIndexMismatch)?;
+            Ok((
+                record.withdraw_withheld_authority_elgamal_pubkey,
+                &mut record.withheld_amount,
+            ))
+        }
+        Ordering::Greater => Err(TokenError::ConfidentialTransferFeeKeyIndexMismatch.into()),
+    }
+}
+
+/// Processes a [`WithdrawWithheldTokensFromMint`] or
+/// [`WithdrawWithheldTokensFromMintForKeyIndex`] instruction. If `key_index` is
+/// `None`, the withheld amount is withdrawn from the current key index.
 fn process_withdraw_withheld_tokens_from_mint(
     program_id: &Address,
     accounts: &mut [AccountView],
+    key_index: Option<u64>,
     new_decryptable_available_balance: &DecryptableBalance,
     proof_instruction_offset: i64,
 ) -> ProgramResult {
@@ -109,8 +184,13 @@ fn process_withdraw_withheld_tokens_from_mint(
     // check since it is not possible to initialize a confidential transfer mint
     // without it
 
-    let confidential_transfer_fee_config =
-        mint.get_extension_mut::<ConfidentialTransferFeeConfig>()?;
+    let current_key_index = current_key_index(&mint)?;
+    let (withdraw_withheld_authority_elgamal_pubkey, mint_withheld_amount) =
+        get_key_index_bucket_mut(
+            &mut mint,
+            key_index.unwrap_or(current_key_index),
+            current_key_index,
+        )?;
 
     // basic checks for the destination account - must be extended for confidential
     // transfers
@@ -135,9 +215,7 @@ fn process_withdraw_withheld_tokens_from_mint(
 
     // Check that the withdraw authority ElGamal public key associated with the mint
     // is consistent with what was actually used to generate the zkp.
-    if proof_context.first_pubkey
-        != confidential_transfer_fee_config.withdraw_withheld_authority_elgamal_pubkey
-    {
+    if proof_context.first_pubkey != withdraw_withheld_authority_elgamal_pubkey {
         return Err(TokenError::ConfidentialTransferElGamalPubkeyMismatch.into());
     }
     // Check that the ElGamal public key associated with the destination account is
@@ -147,7 +225,7 @@ fn process_withdraw_withheld_tokens_from_mint(
     }
     // Check that the withheld amount ciphertext is consistent with the ciphertext
     // data that was actually used to generate the zkp.
-    if proof_context.first_ciphertext != confidential_transfer_fee_config.withheld_amount {
+    if proof_context.first_ciphertext != *mint_withheld_amount {
         return Err(TokenError::ConfidentialTransferBalanceMismatch.into());
     }
 
@@ -163,15 +241,19 @@ fn process_withdraw_withheld_tokens_from_mint(
         *new_decryptable_available_balance;
 
     // Fee is now withdrawn, so zero out the mint withheld amount.
-    confidential_transfer_fee_config.withheld_amount = EncryptedWithheldAmount::zeroed();
+    *mint_withheld_amount = EncryptedWithheldAmount::zeroed();
 
     Ok(())
 }
 
-/// Processes a [`WithdrawWithheldTokensFromAccounts`] instruction.
+/// Processes a [`WithdrawWithheldTokensFromAccounts`] or
+/// [`WithdrawWithheldTokensFromAccountsForKeyIndex`] instruction. If `key_index`
+/// is `None`, the withheld amounts are withdrawn from accounts at the current
+/// key index.
 fn process_withdraw_withheld_tokens_from_accounts(
     program_id: &Address,
     accounts: &mut [AccountView],
+    key_index: Option<u64>,
     num_token_accounts: u8,
     new_decryptable_available_balance: &DecryptableBalance,
     proof_instruction_offset: i64,
@@ -233,6 +315,9 @@ fn process_withdraw_withheld_tokens_from_accounts(
         return Err(TokenError::AccountFrozen.into());
     }
 
+    let current_key_index = current_key_index(&mint)?;
+    let key_index = key_index.unwrap_or(current_key_index);
+
     // summation of withheld amount ciphertexts is expensive, so do all preliminary
     // checks before the summation
     {
@@ -246,11 +331,9 @@ fn process_withdraw_withheld_tokens_from_accounts(
 
         // Checks that the withdraw authority ElGamal public key associated with the
         // mint is consistent with what was actually used to generate the zkp.
-        let confidential_transfer_fee_config =
-            mint.get_extension::<ConfidentialTransferFeeConfig>()?;
-        if proof_context.first_pubkey
-            != confidential_transfer_fee_config.withdraw_withheld_authority_elgamal_pubkey
-        {
+        let withdraw_withheld_authority_elgamal_pubkey =
+            get_key_index_elgamal_pubkey(&mint, key_index, current_key_index)?;
+        if proof_context.first_pubkey != withdraw_withheld_authority_elgamal_pubkey {
             return Err(TokenError::ConfidentialTransferElGamalPubkeyMismatch.into());
         }
         // Checks that the ElGamal public key associated with the destination account is
@@ -265,6 +348,14 @@ fn process_withdraw_withheld_tokens_from_accounts(
     for account_info in account_info_iter.skip(num_signers) {
         // self-harvest, can't double-borrow the underlying data
         if account_info.address() == &destination_account_address {
+            if account_key_index(&destination_account)?.unwrap_or(0) != key_index {
+                msg!(
+                    "Error harvesting from {}: {}",
+                    account_info.address(),
+                    TokenError::ConfidentialTransferFeeKeyIndexMismatch
+                );
+                continue;
+            }
             let destination_confidential_transfer_fee_amount = destination_account
                 .get_extension_mut::<ConfidentialTransferFeeAmount>()
                 .map_err(|_| TokenError::InvalidState)?;
@@ -278,8 +369,10 @@ fn process_withdraw_withheld_tokens_from_accounts(
             destination_confidential_transfer_fee_amount.withheld_amount =
                 EncryptedWithheldAmount::zeroed();
         } else {
-            match harvest_from_account(&mint_account_address, account_info) {
-                Ok(encrypted_withheld_amount) => {
+            match harvest_from_account(&mint_account_address, account_info, |account_key_index| {
+                account_key_index == key_index
+            }) {
+                Ok((encrypted_withheld_amount, _)) => {
                     aggregate_withheld_amount = ciphertext_arithmetic::add(
                         &aggregate_withheld_amount,
                         &encrypted_withheld_amount,
@@ -316,10 +409,14 @@ fn process_withdraw_withheld_tokens_from_accounts(
     Ok(())
 }
 
+/// Clears the withheld amount of a token account and returns it with its key
+/// index. The account is left untouched if `is_valid_key_index` rejects its key
+/// index.
 fn harvest_from_account<'b>(
     mint_key: &'b Address,
     token_account_info: &'b mut AccountView,
-) -> Result<EncryptedWithheldAmount, TokenError> {
+    is_valid_key_index: impl FnOnce(u64) -> bool,
+) -> Result<(EncryptedWithheldAmount, u64), TokenError> {
     // Note: Storing the address of the account so borrow checker doesn't complain about
     // multiple borrows of `token_account_info`.
     let token_account_owner = *token_account_info.owner();
@@ -335,6 +432,13 @@ fn harvest_from_account<'b>(
     }
     check_program_account(&token_account_owner).map_err(|_| TokenError::InvalidState)?;
 
+    let key_index = account_key_index(&token_account)
+        .map_err(|_| TokenError::InvalidState)?
+        .unwrap_or(0);
+    if !is_valid_key_index(key_index) {
+        return Err(TokenError::ConfidentialTransferFeeKeyIndexMismatch);
+    }
+
     let confidential_transfer_token_account = token_account
         .get_extension_mut::<ConfidentialTransferFeeAmount>()
         .map_err(|_| TokenError::InvalidState)?;
@@ -342,7 +446,7 @@ fn harvest_from_account<'b>(
     let withheld_amount = confidential_transfer_token_account.withheld_amount;
     confidential_transfer_token_account.withheld_amount = EncryptedWithheldAmount::zeroed();
 
-    Ok(withheld_amount)
+    Ok((withheld_amount, key_index))
 }
 
 /// Process a [`HarvestWithheldTokensToMint`] instruction.
@@ -359,8 +463,8 @@ fn process_harvest_withheld_tokens_to_mint(accounts: &mut [AccountView]) -> Prog
     let mut mint_data = mint_account_info.try_borrow_mut()?;
     let mut mint = PodStateWithExtensionsMut::<PodMint>::unpack(&mut mint_data)?;
     mint.get_extension::<TransferFeeConfig>()?;
-    let confidential_transfer_fee_mint =
-        mint.get_extension_mut::<ConfidentialTransferFeeConfig>()?;
+    let current_key_index = current_key_index(&mint)?;
+    let confidential_transfer_fee_mint = mint.get_extension::<ConfidentialTransferFeeConfig>()?;
 
     let harvest_to_mint_enabled: bool = confidential_transfer_fee_mint
         .harvest_to_mint_enabled
@@ -369,16 +473,22 @@ fn process_harvest_withheld_tokens_to_mint(accounts: &mut [AccountView]) -> Prog
         return Err(TokenError::HarvestToMintDisabled.into());
     }
 
+    let mut current_mint_withheld_amount = confidential_transfer_fee_mint.withheld_amount;
     for token_account_info in account_info_iter {
-        match harvest_from_account(&mint_account_address, token_account_info) {
-            Ok(withheld_amount) => {
-                let new_mint_withheld_amount = ciphertext_arithmetic::add(
-                    &confidential_transfer_fee_mint.withheld_amount,
-                    &withheld_amount,
-                )
-                .ok_or(TokenError::CiphertextArithmeticFailed)?;
-
-                confidential_transfer_fee_mint.withheld_amount = new_mint_withheld_amount;
+        match harvest_from_account(&mint_account_address, token_account_info, |key_index| {
+            key_index <= current_key_index
+        }) {
+            Ok((withheld_amount, key_index)) if key_index == current_key_index => {
+                current_mint_withheld_amount =
+                    ciphertext_arithmetic::add(&current_mint_withheld_amount, &withheld_amount)
+                        .ok_or(TokenError::CiphertextArithmeticFailed)?;
+            }
+            Ok((withheld_amount, key_index)) => {
+                let (_, mint_withheld_amount) =
+                    get_key_index_bucket_mut(&mut mint, key_index, current_key_index)?;
+                *mint_withheld_amount =
+                    ciphertext_arithmetic::add(mint_withheld_amount, &withheld_amount)
+                        .ok_or(TokenError::CiphertextArithmeticFailed)?;
             }
             Err(e) => {
                 msg!(
@@ -389,6 +499,9 @@ fn process_harvest_withheld_tokens_to_mint(accounts: &mut [AccountView]) -> Prog
             }
         }
     }
+
+    mint.get_extension_mut::<ConfidentialTransferFeeConfig>()?
+        .withheld_amount = current_mint_withheld_amount;
     Ok(())
 }
 
@@ -458,6 +571,176 @@ fn process_disable_harvest_to_mint(
     Ok(())
 }
 
+/// Process a [`RotateWithdrawWithheldAuthorityElGamalPubkey`] instruction.
+fn process_rotate_withdraw_withheld_authority_elgamal_pubkey(
+    program_id: &Address,
+    accounts: &mut [AccountView],
+    expected_key_index: u64,
+    new_withdraw_withheld_authority_elgamal_pubkey: &PodElGamalPubkey,
+    proof_instruction_offset: i64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter_mut();
+    let mint_account_info = next_account_view(account_info_iter)?;
+
+    // zero-knowledge proof certifies that the new ElGamal public key is valid
+    let proof_context = verify_and_extract_context::<
+        PubkeyValidityProofData,
+        PubkeyValidityProofContext,
+    >(account_info_iter, proof_instruction_offset, None)?;
+    if proof_context.pubkey != *new_withdraw_withheld_authority_elgamal_pubkey {
+        return Err(TokenError::ConfidentialTransferElGamalPubkeyMismatch.into());
+    }
+
+    let confidential_transfer_fee_authority_info = next_account_view(account_info_iter)?;
+    let confidential_transfer_fee_authority_info_data_len =
+        confidential_transfer_fee_authority_info.data_len();
+    let withdraw_withheld_authority_info = next_account_view(account_info_iter)?;
+    let withdraw_withheld_authority_info_data_len = withdraw_withheld_authority_info.data_len();
+    let signers = account_info_iter.as_slice();
+
+    check_program_account(mint_account_info.owner())?;
+
+    let retired_record = {
+        let mint_data = mint_account_info.try_borrow()?;
+        let mint = PodStateWithExtensions::<PodMint>::unpack(&mint_data)?;
+
+        if current_key_index(&mint)? != expected_key_index {
+            return Err(TokenError::ConfidentialTransferFeeKeyIndexMismatch.into());
+        }
+        if expected_key_index >= MAX_KEY_HISTORY_LEN as u64 {
+            return Err(TokenError::ConfidentialTransferFeeKeyHistoryFull.into());
+        }
+
+        // The key history must outlive every token account that refers to it, so
+        // the mint must never be closable
+        if let Ok(mint_close_authority) = mint.get_extension::<MintCloseAuthority>() {
+            if Option::<Address>::from(mint_close_authority.close_authority).is_some() {
+                return Err(TokenError::MintHasCloseAuthority.into());
+            }
+        }
+
+        let confidential_transfer_fee_config =
+            mint.get_extension::<ConfidentialTransferFeeConfig>()?;
+        if confidential_transfer_fee_config.withdraw_withheld_authority_elgamal_pubkey
+            == *new_withdraw_withheld_authority_elgamal_pubkey
+        {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let confidential_transfer_fee_authority =
+            Option::<Address>::from(confidential_transfer_fee_config.authority)
+                .ok_or(TokenError::NoAuthorityExists)?;
+        Processor::validate_owner(
+            program_id,
+            &confidential_transfer_fee_authority,
+            confidential_transfer_fee_authority_info,
+            confidential_transfer_fee_authority_info_data_len,
+            signers,
+        )?;
+
+        // If there is no withdraw withheld authority, then the withheld fees can
+        // never be withdrawn, so the confidential transfer fee authority alone is
+        // enough
+        let transfer_fee_config = mint.get_extension::<TransferFeeConfig>()?;
+        if let Some(withdraw_withheld_authority) =
+            Option::<Address>::from(transfer_fee_config.withdraw_withheld_authority)
+        {
+            Processor::validate_owner(
+                program_id,
+                &withdraw_withheld_authority,
+                withdraw_withheld_authority_info,
+                withdraw_withheld_authority_info_data_len,
+                signers,
+            )?;
+        }
+
+        ConfidentialTransferFeeKeyRecord {
+            withdraw_withheld_authority_elgamal_pubkey: confidential_transfer_fee_config
+                .withdraw_withheld_authority_elgamal_pubkey,
+            withheld_amount: confidential_transfer_fee_config.withheld_amount,
+        }
+    };
+
+    alloc_and_append_to_variable_len_extension::<PodMint, ConfidentialTransferFeeKeyHistory>(
+        mint_account_info,
+        bytemuck::bytes_of(&retired_record),
+    )?;
+
+    let mut mint_data = mint_account_info.try_borrow_mut()?;
+    let mut mint = PodStateWithExtensionsMut::<PodMint>::unpack(&mut mint_data)?;
+    let confidential_transfer_fee_config =
+        mint.get_extension_mut::<ConfidentialTransferFeeConfig>()?;
+    confidential_transfer_fee_config.withdraw_withheld_authority_elgamal_pubkey =
+        *new_withdraw_withheld_authority_elgamal_pubkey;
+    confidential_transfer_fee_config.withheld_amount = EncryptedWithheldAmount::zeroed();
+
+    Ok(())
+}
+
+/// Process an [`InitializeAccountKeyIndex`] instruction.
+fn process_initialize_account_key_index(accounts: &mut [AccountView]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter_mut();
+    let token_account_info = next_account_view(account_info_iter)?;
+    let mint_info = next_account_view(account_info_iter)?;
+
+    check_program_account(mint_info.owner())?;
+    let current_key_index = {
+        let mint_data = mint_info.try_borrow()?;
+        let mint = PodStateWithExtensions::<PodMint>::unpack(&mint_data)?;
+        current_key_index(&mint)?
+    };
+    // Accounts of a mint that has never rotated its key stay untagged
+    if current_key_index == 0 {
+        return Err(TokenError::InvalidState.into());
+    }
+
+    check_program_account(token_account_info.owner())?;
+    let key_index = {
+        let token_account_data = token_account_info.try_borrow()?;
+        let token_account = PodStateWithExtensions::<PodAccount>::unpack(&token_account_data)?;
+        if token_account.base.mint != *mint_info.address() {
+            return Err(TokenError::MintMismatch.into());
+        }
+        let confidential_transfer_fee_amount =
+            token_account.get_extension::<ConfidentialTransferFeeAmount>()?;
+
+        // Anyone can tag an account, so a transaction that tags the account
+        // before using it must not fail if another caller tagged it first
+        if account_key_index(&token_account)?.is_some() {
+            return Ok(());
+        }
+
+        // A nonzero withheld amount of an untagged account is encrypted under the
+        // key that the mint was initialized with
+        if confidential_transfer_fee_amount.withheld_amount == EncryptedWithheldAmount::zeroed() {
+            current_key_index
+        } else {
+            0
+        }
+    };
+
+    // if a payer account for reallocation is provided, then reallocate
+    if let Ok(payer_info) = next_account_view(account_info_iter) {
+        let _system_program_info = next_account_view(account_info_iter)?;
+        let mut extension_types = {
+            let token_account_data = token_account_info.try_borrow()?;
+            let token_account = PodStateWithExtensions::<PodAccount>::unpack(&token_account_data)?;
+            token_account.get_extension_types()?
+        };
+        extension_types.push(ExtensionType::ConfidentialTransferFeeKeyIndex);
+        reallocate_for_extension_types(token_account_info, payer_info, &extension_types)?;
+    }
+
+    let mut token_account_data = token_account_info.try_borrow_mut()?;
+    let mut token_account =
+        PodStateWithExtensionsMut::<PodAccount>::unpack(&mut token_account_data)?;
+    let confidential_transfer_fee_key_index =
+        token_account.init_extension::<ConfidentialTransferFeeKeyIndex>(false)?;
+    confidential_transfer_fee_key_index.key_index = key_index.into();
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub(crate) fn process_instruction(
     program_id: &Address,
@@ -483,6 +766,7 @@ pub(crate) fn process_instruction(
             process_withdraw_withheld_tokens_from_mint(
                 program_id,
                 accounts,
+                None,
                 &data.new_decryptable_available_balance,
                 data.proof_instruction_offset as i64,
             )
@@ -493,6 +777,7 @@ pub(crate) fn process_instruction(
             process_withdraw_withheld_tokens_from_accounts(
                 program_id,
                 accounts,
+                None,
                 data.num_token_accounts,
                 &data.new_decryptable_available_balance,
                 data.proof_instruction_offset as i64,
@@ -509,6 +794,52 @@ pub(crate) fn process_instruction(
         ConfidentialTransferFeeInstruction::DisableHarvestToMint => {
             msg!("ConfidentialTransferFeeInstruction::DisableHarvestToMint");
             process_disable_harvest_to_mint(program_id, accounts)
+        }
+        ConfidentialTransferFeeInstruction::RotateWithdrawWithheldAuthorityElGamalPubkey => {
+            msg!(
+                "ConfidentialTransferFeeInstruction::RotateWithdrawWithheldAuthorityElGamalPubkey"
+            );
+            let data =
+                decode_instruction_data::<RotateWithdrawWithheldAuthorityElGamalPubkeyData>(input)?;
+            process_rotate_withdraw_withheld_authority_elgamal_pubkey(
+                program_id,
+                accounts,
+                data.expected_key_index.into(),
+                &data.new_withdraw_withheld_authority_elgamal_pubkey,
+                data.proof_instruction_offset as i64,
+            )
+        }
+        ConfidentialTransferFeeInstruction::WithdrawWithheldTokensFromMintForKeyIndex => {
+            msg!("ConfidentialTransferFeeInstruction::WithdrawWithheldTokensFromMintForKeyIndex");
+            let data =
+                decode_instruction_data::<WithdrawWithheldTokensFromMintForKeyIndexData>(input)?;
+            process_withdraw_withheld_tokens_from_mint(
+                program_id,
+                accounts,
+                Some(data.key_index.into()),
+                &data.new_decryptable_available_balance,
+                data.proof_instruction_offset as i64,
+            )
+        }
+        ConfidentialTransferFeeInstruction::WithdrawWithheldTokensFromAccountsForKeyIndex => {
+            msg!(
+                "ConfidentialTransferFeeInstruction::WithdrawWithheldTokensFromAccountsForKeyIndex"
+            );
+            let data = decode_instruction_data::<WithdrawWithheldTokensFromAccountsForKeyIndexData>(
+                input,
+            )?;
+            process_withdraw_withheld_tokens_from_accounts(
+                program_id,
+                accounts,
+                Some(data.key_index.into()),
+                data.num_token_accounts,
+                &data.new_decryptable_available_balance,
+                data.proof_instruction_offset as i64,
+            )
+        }
+        ConfidentialTransferFeeInstruction::InitializeAccountKeyIndex => {
+            msg!("ConfidentialTransferFeeInstruction::InitializeAccountKeyIndex");
+            process_initialize_account_key_index(accounts)
         }
     }
 }
