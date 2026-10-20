@@ -268,6 +268,24 @@ pub enum TokenError {
     /// Pending supply is not zero
     #[error("Key rotation attempted while pending balance is not zero")]
     PendingBalanceNonZero,
+    /// Confidential transfer fee key index does not match
+    #[error("Confidential transfer fee key index does not match")]
+    ConfidentialTransferFeeKeyIndexMismatch,
+
+    // 70
+    /// Account must initialize its confidential transfer fee key index
+    #[error("Account must initialize its confidential transfer fee key index")]
+    ConfidentialTransferFeeKeyIndexMissing,
+    /// Account has withheld fees under a previous withdraw withheld authority
+    /// ElGamal key that must be harvested
+    #[error("Account has withheld fees under a previous ElGamal key that must be harvested")]
+    ConfidentialTransferFeeWithheldAmountStale,
+    /// Confidential transfer fee key history is full
+    #[error("Confidential transfer fee key history is full")]
+    ConfidentialTransferFeeKeyHistoryFull,
+    /// Mint has a close authority
+    #[error("Mint has a close authority")]
+    MintHasCloseAuthority,
 }
 impl From<TokenError> for ProgramError {
     fn from(e: TokenError) -> Self {
@@ -464,6 +482,21 @@ impl ToStr for TokenError {
             }
             TokenError::PendingBalanceNonZero => {
                 "Key rotation attempted while pending balance is not zero"
+            }
+            TokenError::ConfidentialTransferFeeKeyIndexMismatch => {
+                "Confidential transfer fee key index does not match"
+            }
+            TokenError::ConfidentialTransferFeeKeyIndexMissing => {
+                "Account must initialize its confidential transfer fee key index"
+            }
+            TokenError::ConfidentialTransferFeeWithheldAmountStale => {
+                "Account has withheld fees under a previous ElGamal key that must be harvested"
+            }
+            TokenError::ConfidentialTransferFeeKeyHistoryFull => {
+                "Confidential transfer fee key history is full"
+            }
+            TokenError::MintHasCloseAuthority => {
+                "Mint has a close authority"
             }
         }
     }

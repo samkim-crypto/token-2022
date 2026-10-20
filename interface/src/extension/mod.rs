@@ -12,6 +12,7 @@ use {
             confidential_transfer::{ConfidentialTransferAccount, ConfidentialTransferMint},
             confidential_transfer_fee::{
                 ConfidentialTransferFeeAmount, ConfidentialTransferFeeConfig,
+                ConfidentialTransferFeeKeyIndex,
             },
             cpi_guard::CpiGuard,
             default_account_state::DefaultAccountState,
@@ -384,6 +385,52 @@ fn get_extension_bytes_mut<S: BaseState, V: Extension>(
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(&mut tlv_data[value_start..value_end])
+}
+
+/// Fetches the bytes for a TLV entry, or `None` if the entry is absent
+///
+/// Unlike `get_extension_bytes`, this distinguishes an absent entry from
+/// malformed TLV data, which `get_extension_indices` can report with the same
+/// error.
+fn get_extension_bytes_if_present<S: BaseState, V: Extension>(
+    tlv_data: &[u8],
+) -> Result<Option<&[u8]>, ProgramError> {
+    if V::TYPE.get_account_type() != S::ACCOUNT_TYPE {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut start_index = 0;
+    while start_index < tlv_data.len() {
+        let tlv_indices = get_tlv_indices(start_index);
+        if tlv_data.len() < tlv_indices.length_start {
+            // There aren't enough bytes to store the next type, which means we
+            // got to the end
+            return Ok(None);
+        }
+        let extension_type = u16::from_le_bytes(
+            tlv_data[tlv_indices.type_start..tlv_indices.length_start]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        if extension_type == u16::from(ExtensionType::Uninitialized) {
+            return Ok(None);
+        }
+        if tlv_data.len() < tlv_indices.value_start {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let length = bytemuck::try_from_bytes::<Length>(
+            &tlv_data[tlv_indices.length_start..tlv_indices.value_start],
+        )
+        .map_err(|_| ProgramError::InvalidArgument)?;
+        let value_end_index = tlv_indices.value_start.saturating_add(usize::from(*length));
+        if value_end_index > tlv_data.len() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if extension_type == u16::from(V::TYPE) {
+            return Ok(Some(&tlv_data[tlv_indices.value_start..value_end_index]));
+        }
+        start_index = value_end_index;
+    }
+    Ok(None)
 }
 
 /// Calculate the new expected size if the state allocates the given number
@@ -1139,6 +1186,11 @@ pub enum ExtensionType {
     PausableAccount,
     /// Tokens burning requires approval from authority.
     PermissionedBurn,
+    /// Retired confidential transfer fee withdraw withheld authority ElGamal
+    /// keys and their harvested fees
+    ConfidentialTransferFeeKeyHistory,
+    /// Key index of the confidential withheld transfer fees in an account
+    ConfidentialTransferFeeKeyIndex,
 
     /// Test variable-length mint extension
     #[cfg(test)]
@@ -1174,6 +1226,7 @@ impl ExtensionType {
     const fn sized(&self) -> bool {
         match self {
             ExtensionType::TokenMetadata => false,
+            ExtensionType::ConfidentialTransferFeeKeyHistory => false,
             #[cfg(test)]
             ExtensionType::VariableLenMintTest => false,
             _ => true,
@@ -1221,6 +1274,10 @@ impl ExtensionType {
             ExtensionType::Pausable => size_of::<PausableConfig>(),
             ExtensionType::PausableAccount => size_of::<PausableAccount>(),
             ExtensionType::PermissionedBurn => size_of::<PermissionedBurnConfig>(),
+            ExtensionType::ConfidentialTransferFeeKeyHistory => unreachable!(),
+            ExtensionType::ConfidentialTransferFeeKeyIndex => {
+                size_of::<ConfidentialTransferFeeKeyIndex>()
+            }
             #[cfg(test)]
             ExtensionType::AccountPaddingTest => size_of::<AccountPaddingTest>(),
             #[cfg(test)]
@@ -1272,7 +1329,8 @@ impl ExtensionType {
             | ExtensionType::TokenGroupMember
             | ExtensionType::ScaledUiAmount
             | ExtensionType::Pausable
-            | ExtensionType::PermissionedBurn => AccountType::Mint,
+            | ExtensionType::PermissionedBurn
+            | ExtensionType::ConfidentialTransferFeeKeyHistory => AccountType::Mint,
             ExtensionType::ImmutableOwner
             | ExtensionType::TransferFeeAmount
             | ExtensionType::ConfidentialTransferAccount
@@ -1281,7 +1339,8 @@ impl ExtensionType {
             | ExtensionType::TransferHookAccount
             | ExtensionType::CpiGuard
             | ExtensionType::ConfidentialTransferFeeAmount
-            | ExtensionType::PausableAccount => AccountType::Account,
+            | ExtensionType::PausableAccount
+            | ExtensionType::ConfidentialTransferFeeKeyIndex => AccountType::Account,
             #[cfg(test)]
             ExtensionType::VariableLenMintTest => AccountType::Mint,
             #[cfg(test)]
