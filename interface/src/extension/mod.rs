@@ -1554,6 +1554,57 @@ pub fn alloc_and_serialize_variable_len_extension<
     Ok(())
 }
 
+/// Appends bytes to the value of a variable-length extension
+///
+/// This function reallocates the account as needed to accommodate for the
+/// new bytes. If the extension does not exist, it is allocated with the given
+/// bytes as its value.
+///
+/// Unlike `alloc_and_serialize_variable_len_extension`, this function never
+/// unpacks the existing value, so it can be used on extensions that are too
+/// large to deserialize on chain.
+pub fn alloc_and_append_to_variable_len_extension<
+    S: BaseState + Pod,
+    V: Extension + VariableLenPack,
+>(
+    account_info: &mut AccountView,
+    bytes: &[u8],
+) -> Result<(), ProgramError> {
+    let previous_account_len = account_info.data_len();
+    let (new_account_len, current_extension_len) = {
+        let data = account_info.try_borrow()?;
+        let state = PodStateWithExtensions::<S>::unpack(&data)?;
+        let current_extension_len = state.get_extension_bytes::<V>().map(|x| x.len()).ok();
+        let new_extension_len = current_extension_len
+            .unwrap_or(0)
+            .checked_add(bytes.len())
+            .ok_or(ProgramError::InvalidArgument)?;
+        let new_account_len = try_get_new_account_len_for_extension_len::<S, V>(
+            state.get_tlv_data(),
+            new_extension_len,
+        )?;
+        (new_account_len, current_extension_len)
+    };
+
+    if previous_account_len < new_account_len {
+        account_info.resize(new_account_len)?;
+    }
+    let mut buffer = account_info.try_borrow_mut()?;
+    if previous_account_len <= BASE_ACCOUNT_LENGTH {
+        set_account_type::<S>(&mut buffer)?;
+    }
+    let mut state = PodStateWithExtensionsMut::<S>::unpack(&mut buffer)?;
+    let new_bytes = match current_extension_len {
+        Some(current_extension_len) => {
+            let value = state.realloc::<V>(current_extension_len.saturating_add(bytes.len()))?;
+            &mut value[current_extension_len..]
+        }
+        None => state.alloc::<V>(bytes.len(), false)?,
+    };
+    new_bytes.copy_from_slice(bytes);
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use {
